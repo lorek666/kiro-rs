@@ -68,7 +68,10 @@ pub enum Event {
     /// 工具使用
     ToolUse(super::ToolUseEvent),
     /// 计费
-    Metering(()),
+    ///
+    /// 曾经是 `Metering(())`（payload 被整个丢弃，见 `metering.rs` 模块头），
+    /// 现在恢复为携带实际计费信息。
+    Metering(super::MeteringEvent),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
     /// 未知事件 (保留原始帧数据)
@@ -116,7 +119,14 @@ impl Event {
                 let payload = super::ToolUseEvent::from_frame(&frame)?;
                 Ok(Self::ToolUse(payload))
             }
-            EventType::Metering => Ok(Self::Metering(())),
+            EventType::Metering => {
+                // 计费事件的 payload 只用于计量与观测：解析失败**不得**打断事件流，
+                // 也不得让调用方拿到半条错误。兜底成 Unknown（与未知事件同一条路）。
+                match super::MeteringEvent::from_frame(&frame) {
+                    Ok(payload) => Ok(Self::Metering(payload)),
+                    Err(_) => Ok(Self::Unknown {}),
+                }
+            }
             EventType::ContextUsage => {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
@@ -182,5 +192,57 @@ mod tests {
             "assistantResponseEvent"
         );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
+    }
+
+    /// 构造一个 `event` 类消息帧（只填 metering 解析需要的 headers + payload）
+    fn metering_frame(payload: &str) -> Frame {
+        let mut headers = crate::kiro::parser::header::Headers::new();
+        headers.insert(
+            ":message-type".to_string(),
+            crate::kiro::parser::header::HeaderValue::String("event".to_string()),
+        );
+        headers.insert(
+            ":event-type".to_string(),
+            crate::kiro::parser::header::HeaderValue::String("meteringEvent".to_string()),
+        );
+        Frame {
+            headers,
+            payload: payload.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn test_metering_event_carries_credit_usage() {
+        // 缺口回归：这个 payload 以前被 `Metering(())` 整个丢掉
+        let event = Event::from_frame(metering_frame(
+            r#"{"unit":"credit","unitPlural":"credits","usage":0.324}"#,
+        ))
+        .expect("meteringEvent 应可解析");
+        match event {
+            Event::Metering(m) => assert_eq!(m.credits(), Some(0.324)),
+            other => panic!("应解析为 Metering，实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_metering_event_legacy_bare_shape() {
+        let event = Event::from_frame(metering_frame(r#"{"usage":2.5}"#))
+            .expect("legacy 裸形状应可解析");
+        match event {
+            Event::Metering(m) => {
+                assert_eq!(m.credits(), Some(2.5));
+                // unit 缺失时不应变成空串，而是 None
+                assert_eq!(m.unit, None);
+            }
+            other => panic!("应解析为 Metering，实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_metering_malformed_payload_falls_back_to_unknown() {
+        // 非 JSON 不得 panic、不得把错误抛给调用方 —— 走 Unknown
+        let event = Event::from_frame(metering_frame("not-json"))
+            .expect("metering 解析失败不应向上抛错");
+        assert!(matches!(event, Event::Unknown {}));
     }
 }

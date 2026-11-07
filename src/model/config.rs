@@ -98,6 +98,19 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
+    /// 是否在 Anthropic 响应的 `usage` 里附带上游计费 credit（默认 false）
+    ///
+    /// - `false`（默认）：`usage` 只有 `input_tokens` / `output_tokens`，
+    ///   与改动前逐字一致 —— 客户端的计费输入不受影响；credit 仍然进服务端日志。
+    /// - `true`：流式在 `message_delta.usage`、非流式在 `usage` 里额外多一个
+    ///   `credits_used` 字段。属**增量**字段：按 `usage` 严格反序列化的下游
+    ///   （如 new-api）会忽略未知键，但按「字段集合必须完全相等」断言的实现会失败，
+    ///   所以默认关闭。
+    ///
+    /// JSON 键名：`exposeCreditsInUsage`（`rename_all = "camelCase"`）。
+    #[serde(default = "default_expose_credits_in_usage")]
+    pub expose_credits_in_usage: bool,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -155,6 +168,11 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+/// 默认**不**暴露 credit —— 见 `Config::expose_credits_in_usage` 的说明。
+fn default_expose_credits_in_usage() -> bool {
+    false
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -182,6 +200,7 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
+            expose_credits_in_usage: default_expose_credits_in_usage(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,

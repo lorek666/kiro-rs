@@ -412,6 +412,8 @@ struct CredentialEntry {
     disabled_reason: Option<DisabledReason>,
     /// API 调用成功次数
     success_count: u64,
+    /// 累计上游计费 credit 用量（来自 meteringEvent，落盘到 kiro_stats.json）
+    credits_used: f64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
 }
@@ -437,6 +439,12 @@ enum DisabledReason {
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
     success_count: u64,
+    /// 累计 credit 用量
+    ///
+    /// `#[serde(default)]` 是**必须**的：旧版本写出的 kiro_stats.json 没有这个键，
+    /// 不加默认值会让整份统计在升级后解析失败（连 success_count 一起丢）。
+    #[serde(default)]
+    credits_used: f64,
     last_used_at: Option<String>,
 }
 
@@ -472,6 +480,8 @@ pub struct CredentialEntrySnapshot {
     pub email: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
+    /// 累计 credit 用量（上游 meteringEvent 汇总）
+    pub credits_used: f64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理
@@ -598,6 +608,7 @@ impl MultiTokenManager {
                         None
                     },
                     success_count: 0,
+                    credits_used: 0.0,
                     last_used_at: None,
                 }
             })
@@ -1057,6 +1068,7 @@ impl MultiTokenManager {
         for entry in entries.iter_mut() {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
+                entry.credits_used = s.credits_used;
                 entry.last_used_at = s.last_used_at.clone();
             }
         }
@@ -1081,6 +1093,7 @@ impl MultiTokenManager {
                         e.id.to_string(),
                         StatsEntry {
                             success_count: e.success_count,
+                            credits_used: e.credits_used,
                             last_used_at: e.last_used_at.clone(),
                         },
                     )
@@ -1136,6 +1149,42 @@ impl MultiTokenManager {
                     "凭据 #{} API 调用成功（累计 {} 次）",
                     id,
                     entry.success_count
+                );
+            }
+        }
+        self.save_stats_debounced();
+    }
+
+    /// 报告指定凭据的 credit 用量
+    ///
+    /// 数据来源是上游 `meteringEvent` 的 `usage`（见 `model::events::MeteringEvent`），
+    /// 由各请求在事件聚合结束时汇总后回传。落盘方式与 `success_count` 完全一致
+    /// （`save_stats_debounced` → `kiro_stats.json`），因此重启后累计值不丢。
+    ///
+    /// ## 归属口径（有意为之的近似）
+    ///
+    /// credit 只有在**流结束后**才知道，而那时请求上下文已经不在手上；这里按
+    /// `current_id`（本次请求选中的凭据）归属。并发下若期间发生过凭据切换，
+    /// 极少数请求的 credit 会记到相邻凭据上 —— 这是**统计口径**的近似，
+    /// 不参与计费决策，也不影响任何限流/禁用判断（那些走 `report_success` /
+    /// `report_failure` 的精确 `id`）。要精确到请求级需要把凭据 id 贯穿整条
+    /// SSE 流，代价与收益不成比例。
+    ///
+    /// 非有限值 / 负数一律忽略（与 `MeteringEvent::credits` 同口径，双保险）。
+    pub fn report_credits(&self, credits: f64) {
+        if !credits.is_finite() || credits <= 0.0 {
+            return;
+        }
+        let current = *self.current_id.lock();
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == current) {
+                entry.credits_used += credits;
+                tracing::debug!(
+                    "凭据 #{} credit 用量 +{:.4}（累计 {:.4}）",
+                    current,
+                    credits,
+                    entry.credits_used
                 );
             }
         }
@@ -1441,6 +1490,7 @@ impl MultiTokenManager {
                     },
                     email: e.credentials.email.clone(),
                     success_count: e.success_count,
+                    credits_used: e.credits_used,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
@@ -1756,6 +1806,7 @@ impl MultiTokenManager {
                 disabled: false,
                 disabled_reason: None,
                 success_count: 0,
+                credits_used: 0.0,
                 last_used_at: None,
             });
         }
@@ -2255,6 +2306,46 @@ mod tests {
         manager.report_failure(1);
         manager.report_failure(1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    #[test]
+    fn test_multi_token_manager_report_credits_accumulates() {
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        // 非有限值 / 非正值一律忽略（与 MeteringEvent::credits 同口径的双保险）
+        manager.report_credits(0.0);
+        manager.report_credits(-1.0);
+        manager.report_credits(f64::NAN);
+        manager.report_credits(f64::INFINITY);
+        assert_eq!(manager.snapshot().entries[0].credits_used, 0.0);
+
+        // 正常累加
+        manager.report_credits(0.324);
+        manager.report_credits(0.176);
+        let snap = manager.snapshot();
+        let current = snap
+            .entries
+            .iter()
+            .find(|e| e.id == snap.current_id)
+            .expect("current_id 应能在 entries 中找到");
+        assert!(
+            (current.credits_used - 0.5).abs() < 1e-9,
+            "credits_used={}",
+            current.credits_used
+        );
+    }
+
+    #[test]
+    fn test_stats_entry_backward_compatible_without_credits_used() {
+        // 旧版本写出的 kiro_stats.json 没有 credits_used 键：必须能解析，
+        // 否则升级后整份统计（含 success_count）都会被丢掉。
+        let old = r#"{"1":{"success_count":7,"last_used_at":null}}"#;
+        let parsed: std::collections::HashMap<String, StatsEntry> =
+            serde_json::from_str(old).expect("旧格式应可解析");
+        assert_eq!(parsed["1"].success_count, 7);
+        assert_eq!(parsed["1"].credits_used, 0.0);
     }
 
     #[test]

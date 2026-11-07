@@ -125,6 +125,18 @@ impl KiroProvider {
         self.call_mcp_with_retry(request_body).await
     }
 
+    /// 上报一次请求累计到的 credit 用量（来自上游 `meteringEvent`）
+    ///
+    /// 与 `call_api*` 分开是**有意**的：credit 只有在响应流读完时才可知，
+    /// 那时调用方已经拿着 `reqwest::Response` 走了，provider 这一层拿不到。
+    /// 因此由消费方（anthropic handler 的流/非流聚合处）在结束时回传。
+    /// 具体归属口径与精度边界见 [`MultiTokenManager::report_credits`]。
+    ///
+    /// 非有限值 / 非正值由下层忽略，调用方不需要自行校验。
+    pub fn report_credits(&self, credits: f64) {
+        self.token_manager.report_credits(credits);
+    }
+
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();

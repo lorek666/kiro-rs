@@ -158,10 +158,11 @@ async fn main() {
     });
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
-    let anthropic_app = anthropic::create_router_with_provider(
+    let anthropic_app = anthropic::create_router_with_options(
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
+        config.expose_credits_in_usage,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

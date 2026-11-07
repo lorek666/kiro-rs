@@ -1047,6 +1047,70 @@ mod tests {
         );
     }
 
+    /// 口径偏差核查：客户端各种拼写是否都落到 1M 上下文窗口
+    ///
+    /// PRD 假设「版本化名 / 点号名可能回落 200k 默认值，造成 5 倍 token 偏差」。
+    /// 本测试按实际代码路径（`map_model` 用的是 `contains` 子串匹配，不是等值）
+    /// 逐一验证：全部命中 1M，**不存在**回落。
+    #[test]
+    fn test_context_window_matches_every_client_spelling() {
+        // 1M 家族：4.6 起 / sonnet-5 起 / opus-5 起 / fable
+        let expect_1m = [
+            // 题干点名的四种拼写
+            "claude-opus-5-5",
+            "claude-opus-5.5",
+            "claude-opus-5-5-20260101",
+            "claude-sonnet-5-5",
+            // 版本化 / 大小写 / 后缀变体
+            "claude-sonnet-5-5-20260101",
+            "claude-opus-5.5-20260101",
+            "claude-opus-5-5-thinking",
+            "claude-sonnet-5-5-thinking",
+            "Claude-Opus-5-5",
+            "CLAUDE-SONNET-5-5",
+            "claude-opus-5-5[1m]",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4.6",
+            "claude-sonnet-4-6-20250929",
+            "claude-opus-4-6",
+            "claude-opus-4.6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-opus-5-thinking",
+            "claude-sonnet-5",
+            "claude-fable-5-1",
+            "claude-fable-5.1",
+        ];
+        for name in expect_1m {
+            assert_eq!(
+                get_context_window_size(name),
+                1_000_000,
+                "{name} 应命中 1M 窗口（PRD 假设的 200k 回落不应发生）"
+            );
+        }
+
+        // 反向对照：确实只有 200k 的老模型不能被误抬到 1M
+        let expect_200k = [
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4.5",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4.5",
+            "claude-haiku-4-5-20251001",
+            "claude-3-5-sonnet-20241022",
+        ];
+        for name in expect_200k {
+            assert_eq!(
+                get_context_window_size(name),
+                200_000,
+                "{name} 应保持 200k（不能被 5.5/5 分支误吞）"
+            );
+        }
+
+        // 未识别模型：回落 200k 默认值（行为与改动前一致）
+        assert_eq!(get_context_window_size("some-unknown-model"), 200_000);
+    }
+
     #[test]
     fn test_map_model_sonnet_5() {
         assert_eq!(

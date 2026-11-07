@@ -458,6 +458,7 @@ impl SseStateManager {
         &mut self,
         input_tokens: i32,
         output_tokens: i32,
+        credits_used: Option<f64>,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -478,6 +479,14 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
+            // usage 逐键构造而不是整段 json! 字面量：`credits_used` 是**可选**字段，
+            // 开关关闭时必须让 usage 的形状与改动前逐字一致（不出现 null / 0）。
+            let mut usage = serde_json::Map::new();
+            usage.insert("input_tokens".to_string(), json!(input_tokens));
+            usage.insert("output_tokens".to_string(), json!(output_tokens));
+            if let Some(credits) = credits_used {
+                usage.insert("credits_used".to_string(), json!(credits));
+            }
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
@@ -486,10 +495,7 @@ impl SseStateManager {
                         "stop_reason": self.get_stop_reason(),
                         "stop_sequence": null
                     },
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
-                    }
+                    "usage": serde_json::Value::Object(usage)
                 }),
             ));
         }
@@ -542,6 +548,16 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 本 turn 从 meteringEvent 累计到的 credit 用量
+    ///
+    /// 无论是否对外暴露，这个值都会进服务端日志（见 `process_kiro_event`）。
+    pub credits_used: f64,
+    /// 是否在 message_delta 的 usage 里附带 `credits_used`（默认关闭）
+    ///
+    /// 关闭是**有意的**：`input_tokens` / `output_tokens` 是客户端计费输入，
+    /// 多一个字段会让按 usage 严格反序列化的下游出错。开关见
+    /// `Config::expose_credits_in_usage`。
+    pub expose_credits: bool,
 }
 
 impl StreamContext {
@@ -568,6 +584,26 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            credits_used: 0.0,
+            expose_credits: false,
+        }
+    }
+
+    /// 设置是否对外暴露 credit 用量（链式，便于在不改构造器签名的情况下接线）
+    pub fn with_expose_credits(mut self, expose: bool) -> Self {
+        self.expose_credits = expose;
+        self
+    }
+
+    /// 本 turn 实际要写进 usage 的 credit 值
+    ///
+    /// 只有「开关打开 + 本 turn 真的收到过 meteringEvent」才返回 `Some`；
+    /// 关闭时返回 `None`，`usage` 的形状与改动前**逐字一致**。
+    pub fn credits_for_usage(&self) -> Option<f64> {
+        if self.expose_credits && self.credits_used > 0.0 {
+            Some(self.credits_used)
+        } else {
+            None
         }
     }
 
@@ -652,6 +688,28 @@ impl StreamContext {
                     context_usage.context_usage_percentage,
                     actual_input_tokens
                 );
+                Vec::new()
+            }
+            Event::Metering(metering) => {
+                // credit 用量只做计量，不产生下游事件。
+                // 无论 `expose_credits` 开关如何，都必须进服务端日志 —— 这是
+                // 「网关侧可对账」的唯一来源（开关只影响要不要告诉客户端）。
+                if let Some(credits) = metering.credits() {
+                    self.credits_used += credits;
+                    tracing::info!(
+                        model = %self.model,
+                        credits = credits,
+                        credits_total = self.credits_used,
+                        unit = metering.unit_label(),
+                        "收到 meteringEvent，累计 credit 用量"
+                    );
+                } else {
+                    tracing::debug!(
+                        model = %self.model,
+                        raw = ?metering,
+                        "收到 meteringEvent 但 usage 不可用（缺失或非法），已忽略"
+                    );
+                }
                 Vec::new()
             }
             Event::Error {
@@ -1122,8 +1180,11 @@ impl StreamContext {
 
         // 生成最终事件
         events.extend(
-            self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
+            self.state_manager.generate_final_events(
+                final_input_tokens,
+                self.output_tokens,
+                self.credits_for_usage(),
+            ),
         );
         events
     }
@@ -1158,14 +1219,27 @@ impl BufferedStreamContext {
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
-        let inner =
-            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+        let inner = StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map);
         Self {
             inner,
             event_buffer: Vec::new(),
             estimated_input_tokens,
             initial_events_generated: false,
         }
+    }
+
+    /// 设置是否在 `message_delta.usage` 里暴露 credit 用量
+    ///
+    /// 只是把开关透传给内部的 `StreamContext` —— 缓冲路径的 `usage` 由
+    /// `inner.generate_final_events()` 生成，不存在第二份计费口径。
+    pub fn with_expose_credits(mut self, expose: bool) -> Self {
+        self.inner = self.inner.with_expose_credits(expose);
+        self
+    }
+
+    /// 本 turn 累计到的 credit 用量（供调用方落盘到凭据统计）
+    pub fn credits_used(&self) -> f64 {
+        self.inner.credits_used
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -1985,5 +2059,86 @@ mod tests {
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
         );
+    }
+
+    /// 构造一个 meteringEvent 事件对象
+    fn metering_event(usage: f64) -> crate::kiro::model::events::Event {
+        crate::kiro::model::events::Event::Metering(
+            crate::kiro::model::events::MeteringEvent {
+                unit: Some("credit".to_string()),
+                unit_plural: Some("credits".to_string()),
+                usage: Some(usage),
+            },
+        )
+    }
+
+    #[test]
+    fn test_metering_event_accumulates_credits() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        // meteringEvent 不产生任何下游 SSE 事件
+        assert!(ctx.process_kiro_event(&metering_event(0.324)).is_empty());
+        assert!(ctx.process_kiro_event(&metering_event(0.1)).is_empty());
+
+        // 多帧累加（用近似比较避开浮点误差）
+        assert!((ctx.credits_used - 0.424).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_credits_hidden_by_default() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&metering_event(0.324));
+
+        let events = ctx.generate_final_events();
+        let message_delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta");
+        let usage = &message_delta.data["usage"];
+
+        // 默认关闭：usage 形状与改动前逐字一致，不能出现 credits_used
+        assert!(usage.get("credits_used").is_none());
+        assert_eq!(usage["input_tokens"], 1);
+        assert_eq!(usage["output_tokens"], 0);
+        // 累计值仍然进服务端日志，不因为开关关闭而丢失
+        assert!(ctx.credits_used > 0.0);
+    }
+
+    #[test]
+    fn test_credits_exposed_when_enabled() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 7, false, HashMap::new())
+            .with_expose_credits(true);
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&metering_event(0.324));
+        let _ = ctx.process_kiro_event(&metering_event(0.176));
+
+        let events = ctx.generate_final_events();
+        let message_delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta");
+        let usage = &message_delta.data["usage"];
+
+        assert_eq!(usage["input_tokens"], 7);
+        assert_eq!(usage["output_tokens"], 0);
+        let credits = usage["credits_used"].as_f64().expect("credits_used 应为数字");
+        assert!((credits - 0.5).abs() < 1e-9, "credits_used={credits}");
+    }
+
+    #[test]
+    fn test_credits_absent_when_enabled_but_no_metering() {
+        // 开关打开但本 turn 没有 meteringEvent：不该凭空写一个 0
+        let mut ctx = StreamContext::new_with_thinking("test-model", 3, false, HashMap::new())
+            .with_expose_credits(true);
+        let _ = ctx.generate_initial_events();
+
+        let events = ctx.generate_final_events();
+        let message_delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta");
+        assert!(message_delta.data["usage"].get("credits_used").is_none());
     }
 }

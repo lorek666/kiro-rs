@@ -30,4 +30,8 @@ mod stream;
 pub mod types;
 mod websearch;
 
+// 保留原有的两参版构造器导出（对外契约不变）；bin crate 里 `main.rs` 现在走
+// `create_router_with_options`，所以这条 re-export 在本 crate 内没有调用点。
+#[allow(unused_imports)]
 pub use router::create_router_with_provider;
+pub use router::create_router_with_options;

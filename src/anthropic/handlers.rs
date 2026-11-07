@@ -56,6 +56,27 @@ fn map_provider_error(err: Error) -> Response {
         )
             .into_response();
     }
+    // 所有凭据都不可用（被禁用 / 额度用尽 / refreshToken 失效）
+    //
+    // 这类失败**不是**上游服务的瞬时故障，而是本网关已经没有可用凭据 ——
+    // 语义上是「服务暂时无法提供」，回 502 会让调用方误判成上游抖动并继续重试，
+    // 回 503 才是可被识别为「上游不可用」的形态。文案里带上可用数，
+    // 便于 new-api 一侧的日志直接读出根因（旧文案只有中文，无法被规则识别）。
+    //
+    // 判据取 token_manager 的三处 bail! 文案（`所有凭据均已禁用（x/y）`、
+    // `所有凭据已用尽`），这是它们到达本层时的唯一稳定特征。
+    if err_str.contains("所有凭据均已禁用") || err_str.contains("所有凭据已用尽") {
+        tracing::error!(error = %err, "网关无可用凭据，按上游不可用（503）返回");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "upstream_unavailable",
+                format!("No usable Kiro credential is available: {err}"),
+            )),
+        )
+            .into_response();
+    }
+
     tracing::error!("Kiro API 调用失败: {}", err);
     (
         StatusCode::BAD_GATEWAY,
@@ -416,12 +437,13 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.expose_credits_in_usage,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, state.expose_credits_in_usage).await
     }
 }
 
@@ -433,6 +455,7 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    expose_credits: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -441,13 +464,14 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map)
+        .with_expose_credits(expose_credits);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    let stream = create_sse_stream(response, ctx, initial_events, provider);
 
     // 返回 SSE 响应
     Response::builder()
@@ -472,6 +496,7 @@ fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -484,8 +509,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), provider),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, provider)| async move {
             if finished {
                 return None;
             }
@@ -522,26 +547,28 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束
+                            // 流结束：先把 credit 用量回传给凭据统计（落盘），再发最终事件
+                            provider.report_credits(ctx.credits_used);
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider)))
                         }
                         None => {
                             // 流结束，发送最终事件
+                            provider.report_credits(ctx.credits_used);
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider)))
                         }
                     }
                 }
@@ -549,7 +576,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider)))
                 }
             }
         },
@@ -569,6 +596,7 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    expose_credits: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
@@ -604,6 +632,8 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    // 从 meteringEvent 累计的 credit 用量（与开关无关，始终计入服务端日志）
+    let mut credits_used: f64 = 0.0;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -672,6 +702,26 @@ async fn handle_non_stream_request(
                                 actual_input_tokens
                             );
                         }
+                        Event::Metering(metering) => {
+                            // credit 只做计量：无论 `expose_credits` 开关如何都要累计并
+                            // 记日志 —— 开关仅决定要不要告诉客户端（见 Config 说明）。
+                            if let Some(credits) = metering.credits() {
+                                credits_used += credits;
+                                tracing::info!(
+                                    model = %model,
+                                    credits = credits,
+                                    credits_total = credits_used,
+                                    unit = metering.unit_label(),
+                                    "收到 meteringEvent，累计 credit 用量"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    model = %model,
+                                    raw = ?metering,
+                                    "收到 meteringEvent 但 usage 不可用（缺失或非法），已忽略"
+                                );
+                            }
+                        }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
@@ -728,6 +778,14 @@ async fn handle_non_stream_request(
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
+    // usage 逐键构造：`credits_used` 是可选增量字段，关闭时必须与改动前逐字一致
+    let mut usage = serde_json::Map::new();
+    usage.insert("input_tokens".to_string(), json!(final_input_tokens));
+    usage.insert("output_tokens".to_string(), json!(output_tokens));
+    if expose_credits && credits_used > 0.0 {
+        usage.insert("credits_used".to_string(), json!(credits_used));
+    }
+
     // 构建 Anthropic 响应
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
@@ -737,11 +795,12 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": serde_json::Value::Object(usage)
     });
+
+    // 非流式请求在这里就已读完整个事件流，credit 用量可以直接回传给凭据统计
+    // （落盘到 kiro_stats.json；与流式路径同一口径，见 `KiroProvider::report_credits`）
+    provider.report_credits(credits_used);
 
     (StatusCode::OK, Json(response_body)).into_response()
 }
@@ -932,12 +991,13 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.expose_credits_in_usage,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map, state.expose_credits_in_usage).await
     }
 }
 
@@ -952,6 +1012,7 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    expose_credits: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -960,10 +1021,11 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map)
+        .with_expose_credits(expose_credits);
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    let stream = create_buffered_sse_stream(response, ctx, provider);
 
     // 返回 SSE 响应
     Response::builder()
@@ -985,6 +1047,7 @@ async fn handle_stream_request_buffered(
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -995,8 +1058,9 @@ fn create_buffered_sse_stream(
             EventStreamDecoder::new(),
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            provider,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, provider)| async move {
             if finished {
                 return None;
             }
@@ -1011,7 +1075,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider)));
                     }
 
                     // 然后处理数据流
@@ -1040,22 +1104,25 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
+                                // 结束前先把 credit 用量回传给凭据统计（落盘）
+                                provider.report_credits(ctx.credits_used());
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
+                                provider.report_credits(ctx.credits_used());
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider)));
                             }
                         }
                     }

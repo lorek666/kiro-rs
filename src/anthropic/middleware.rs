@@ -25,6 +25,8 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 是否在 `usage` 里暴露上游计费 credit（默认 false，见 `Config::expose_credits_in_usage`）
+    pub expose_credits_in_usage: bool,
 }
 
 impl AppState {
@@ -34,7 +36,14 @@ impl AppState {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            expose_credits_in_usage: false,
         }
+    }
+
+    /// 设置是否在 `usage` 里暴露 credit 用量（链式，保持 `new` 的两参签名不变）
+    pub fn with_expose_credits(mut self, expose: bool) -> Self {
+        self.expose_credits_in_usage = expose;
+        self
     }
 
     /// 设置 KiroProvider
