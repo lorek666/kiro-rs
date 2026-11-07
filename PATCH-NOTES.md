@@ -14,7 +14,8 @@ cd admin-ui && pnpm install && pnpm build   # 产出 admin-ui/dist（rust-embed 
 cd .. && cargo test
 ```
 
-`cargo test` 结果：**233 passed; 0 failed; 0 ignored**，编译期 **0 warning / 0 error**（完整日志见 PR 描述）。
+`cargo test` 结果：**238 passed; 0 failed; 0 ignored**，编译期 **0 warning / 0 error**；
+`cargo clippy --all-targets` 不新增 warning（完整日志见 PR 描述）。
 
 ---
 
@@ -286,7 +287,7 @@ if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
 
 ---
 
-## 5. 测试覆盖（新增 22 个用例）
+## 5. 测试覆盖（新增 27 个用例）
 
 | 用例 | 覆盖点 |
 |---|---|
@@ -312,8 +313,13 @@ if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
 | `token_manager::tests::test_multi_token_manager_report_credits_accumulates` | 落盘累加 + 非法值忽略 |
 | `token_manager::tests::test_stats_entry_backward_compatible_without_credits_used` | 旧 `kiro_stats.json` 兼容 |
 | `converter::tests::test_context_window_matches_every_client_spelling` | 模型名映射表（29 条断言） |
+| `handlers::tests::test_credential_exhausted_messages_map_to_503` | **R1**：三类「无可用凭据」文案（含 `所有凭据均无法获取有效 Token`）→ 503 + `upstream_unavailable` |
+| `handlers::tests::test_is_credential_exhausted_error_predicate` | **R1**：判据纯逻辑，正例 3 类 + 负例 6 条防过宽匹配 |
+| `handlers::tests::test_ordinary_upstream_error_stays_502` | **R1**：普通上游错误（500/400/403/流读失败）→ 502 `api_error` 不变 |
+| `handlers::tests::test_too_many_requests_keeps_original_mapping` | **R1**：429 → 保持 502 原映射 |
+| `handlers::tests::test_bad_request_specials_unaffected` | **R1**：两个 400 特例不被 503 分支波及 |
 
-全量：**233 passed / 0 failed / 0 warning**。
+全量：**238 passed / 0 failed / 0 warning**。
 
 ---
 
@@ -357,3 +363,56 @@ git push --delete mine prd/billing-integrity # 远端（如已推送且需要清
 5. **未做端到端联调**：本次只跑单测（无真实 Kiro 凭据，也不应引入）。
    `meteringEvent` 的真实 payload 形状取自任务给定样例与上游原始实现的字段名，
    若上游实际编码有出入，`Option` + 容错反序列化会退化为「不计数」而不是报错。
+---
+
+## 7.x 已知未验证项（N6–N8）
+
+上一节 1–5 是「未做的事」；这三条是**已实现、但前提未经验证**的点，性质不同，
+单独列出以免被当成「已验证的行为」。三条都**不影响计费正确性**，属观测/运维风险。
+
+### N6 — `meteringEvent.usage` 是增量还是累计：**未验证**
+
+- **现状**：`stream.rs` / `handlers.rs` 对每帧做 `credits_used += credits`，
+  隐含假设「一帧 = 本次增量」。
+- **为什么没有依据**：上游从未定义过这个语义。
+  `99f786b^` 的原始 `metering.rs` 只实现了 `Display`（打印用），没有消费 `usage`；
+  原始 `Event::Metering` 在事件循环里落到 `_ =>` 兜底分支，**从未被消费**。
+  也就是说「一帧代表什么」在上游历史上**没有任何参考实现**，我们的累加是假设。
+  当前无可用真实凭据，无法用真实帧校验。
+- **若假设错误（实为累计值）的后果**：`+=` 会重复计数，credit 统计**高估**。
+  影响面仅限观测数据（`kiro_stats.json` 的 `credits_used` 与日志），
+  **不参与计费、不限流、不影响禁用判定**。
+- **如何判定（无需改代码）**：`tracing::info!` 已同时打印 `credits`（本帧）与
+  `credits_total`（累加）。抓同一次请求的多帧日志：
+  - 各帧 `credits` 小幅新增、`credits_total` 单调累加到真实消耗 → **增量，现有实现正确**；
+  - 各帧 `credits` 本身单调递增且末帧 ≈ 真实消耗（`credits_total` 明显偏大）→ **累计**，
+    需要把 `+=` 改成 `max` / 覆盖赋值。
+- **修法位置**：`src/anthropic/stream.rs` `Event::Metering` 分支、
+  `src/anthropic/handlers.rs` 非流式同名分支（两处，改动量各 1 行）。
+  详见 `src/kiro/model/events/metering.rs` 模块头「未知与风险」一节。
+
+### N7 — 503 判据是基于**文案**的脆弱匹配
+
+- **现状**：`handlers.rs::is_credential_exhausted_error` 用中文字符串片段
+  （`所有凭据均已禁用` / `所有凭据已用尽` / `所有凭据均无法获取有效 Token`）
+  判定「无可用凭据」，命中回 503。
+- **为什么脆**：`token_manager` / `provider` 两层都是 `anyhow::bail!` 纯字符串上抛，
+  没有可 `downcast` 的类型。**改那几处 bail! 文案必须同步改本函数**，
+  否则该分支静默失效 —— 表现为回退成 502，调用方重新把它当上游抖动去重试。
+- **已缓解**：判据集中到单一函数，并把三类文案的 `file:line` 列在注释里；
+  单测 `test_credential_exhausted_messages_map_to_503` 钉住三类文案，
+  `test_is_credential_exhausted_error_predicate` 含负例防过宽匹配。
+- **根治方向**：把「无可用凭据」提成具名错误类型（如 `NoAvailableCredentialError`），
+  调用方 `downcast_ref` 判定。本次为最小改动未做。
+
+### N8 — credit 归属口径是统计级近似
+
+- **现状**：`token_manager.rs::report_credits` 按 `*self.current_id.lock()` 归属。
+- **不会死锁**：该 guard 是**语句内临时量**（语句结束即 drop），不跨语句存活，
+  与仓库内「先 `entries` 后 `current_id`」的常规顺序**不会反向**，无 ABBA 条件。
+- **但仍是两个独立临界区**：读 `current_id` 与锁 `entries` 之间若发生凭据切换，
+  本次 credit 会记到切换后的条目上。
+- **影响**：仅统计归属可能偏移到相邻凭据；不影响计费/限流/禁用判定
+  （那些走 `report_success` / `report_failure` 的精确 `id`）。
+- **修法**：若将来需要请求级精确，需把凭据 id 从 `acquire_context` 一路贯穿到
+  SSE 流结束（改动面较大，本次未做）。

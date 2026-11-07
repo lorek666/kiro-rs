@@ -27,6 +27,36 @@ use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
 
+/// 「本网关已无可用凭据」的文案判据
+///
+/// 返回 `true` 表示这个错误属于「没有可用凭据」这一类终态 —— 它不是上游的瞬时
+/// 抖动，而是本网关自己无号可用，`map_provider_error` 据此回 503 而不是 502。
+///
+/// ## ⚠️ 这是基于**文案**的脆弱匹配
+///
+/// 判断依据是错误字符串里的中文片段，**不是**结构化错误码 —— 因为
+/// `token_manager` / `provider` 这两层都是 `anyhow::bail!` 纯字符串上抛，
+/// 没有可供 `downcast` 的类型。**改这几处 bail! 文案时必须同步改本函数**，
+/// 否则该分支静默失效（表现为回退成 502，调用方重新把它当上游抖动去重试）。
+///
+/// 想要根治应当把「无可用凭据」提成一个具名错误类型
+/// （例如 `NoAvailableCredentialError`），由调用方 `downcast_ref` 判定；
+/// 本次为最小改动仍沿用文案匹配，风险已记入 `PATCH-NOTES.md` §7（N7）。
+///
+/// 三类文案对应的产生点（改文案时逐条核对）：
+///
+/// | 文案 | 产生点 |
+/// |---|---|
+/// | `所有凭据均无法获取有效 Token（可用: x/y）` | `src/kiro/token_manager.rs:774` |
+/// | `所有凭据均已禁用（x/y）` / `（0/y）` | `src/kiro/token_manager.rs:834`、`:856` |
+/// | `所有凭据已用尽` | `src/kiro/provider.rs:220`、`:246`、`:388`、`:433` |
+fn is_credential_exhausted_error(err_str: &str) -> bool {
+    err_str.contains("所有凭据均已禁用")
+        || err_str.contains("所有凭据已用尽")
+        // refresh 全部失败、拿不到有效 token 的终态（与「被禁用」等价：都已无号可用）
+        || err_str.contains("所有凭据均无法获取有效 Token")
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
@@ -56,16 +86,15 @@ fn map_provider_error(err: Error) -> Response {
         )
             .into_response();
     }
-    // 所有凭据都不可用（被禁用 / 额度用尽 / refreshToken 失效）
+    // 所有凭据都不可用（被禁用 / 额度用尽 / refresh 全失败拿不到 token）
     //
     // 这类失败**不是**上游服务的瞬时故障，而是本网关已经没有可用凭据 ——
     // 语义上是「服务暂时无法提供」，回 502 会让调用方误判成上游抖动并继续重试，
     // 回 503 才是可被识别为「上游不可用」的形态。文案里带上可用数，
     // 便于 new-api 一侧的日志直接读出根因（旧文案只有中文，无法被规则识别）。
     //
-    // 判据取 token_manager 的三处 bail! 文案（`所有凭据均已禁用（x/y）`、
-    // `所有凭据已用尽`），这是它们到达本层时的唯一稳定特征。
-    if err_str.contains("所有凭据均已禁用") || err_str.contains("所有凭据已用尽") {
+    // 判据（文案 → 产生点）与脆弱性说明集中在 `is_credential_exhausted_error`。
+    if is_credential_exhausted_error(&err_str) {
         tracing::error!(error = %err, "网关无可用凭据，按上游不可用（503）返回");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1131,4 +1160,120 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    /// 调一次 `map_provider_error`，取回状态码与已解析的 JSON body
+    async fn map(err_text: &str) -> (StatusCode, serde_json::Value) {
+        let response = map_provider_error(anyhow::anyhow!("{}", err_text));
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("错误响应应可读取 body");
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("错误响应 body 应是合法 JSON");
+        (status, json)
+    }
+
+    /// R1 回归：三类「无可用凭据」文案都必须映射成 503 + upstream_unavailable。
+    ///
+    /// 漏掉 `所有凭据均无法获取有效 Token（可用: x/y）` 时，refresh 全失败的终态
+    /// 会回 502，调用方（new-api）无法与「上游抖动」区分 —— 这条就是钉住它。
+    #[tokio::test]
+    async fn test_credential_exhausted_messages_map_to_503() {
+        for err_text in [
+            // token_manager.rs:834 / :856
+            "所有凭据均已禁用（0/3）",
+            "所有凭据均已禁用（1/2）",
+            // token_manager.rs:774 —— R1 补进来的那一类
+            "所有凭据均无法获取有效 Token（可用: 0/3）",
+            "所有凭据均无法获取有效 Token（可用: 1/1）",
+            // provider.rs:220 / :246 / :388 / :433
+            "MCP 请求失败（所有凭据已用尽）: 402 Payment Required",
+            "ide API 请求失败（所有凭据已用尽）: 402 Payment Required",
+        ] {
+            let (status, body) = map(err_text).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "「{err_text}」应映射为 503"
+            );
+            assert_eq!(
+                body["error"]["type"], "upstream_unavailable",
+                "「{err_text}」的 error.type 应是 upstream_unavailable"
+            );
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("No usable Kiro credential")),
+                "「{err_text}」的 message 应说明无可用凭据"
+            );
+        }
+    }
+
+    /// 普通上游错误保持原映射（502 api_error），不能被 503 分支误吞
+    #[tokio::test]
+    async fn test_ordinary_upstream_error_stays_502() {
+        for err_text in [
+            "ide API 请求失败: 500 Internal Server Error",
+            "ide API 请求失败: 400 Bad Request",
+            "上游返回 403: request illegal",
+            "读取响应流失败: connection reset",
+        ] {
+            let (status, body) = map(err_text).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "「{err_text}」应保持 502");
+            assert_eq!(body["error"]["type"], "api_error");
+        }
+    }
+
+    /// 429 保持原映射：本层不做特殊处理，仍是 502 api_error
+    /// （429 的「只重试不换号」发生在 provider 层，不在这里）
+    #[tokio::test]
+    async fn test_too_many_requests_keeps_original_mapping() {
+        let (status, body) = map("ide API 请求失败: 429 Too Many Requests").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["type"], "api_error");
+    }
+
+    /// 两个 400 特例不能被新判据波及
+    #[tokio::test]
+    async fn test_bad_request_specials_unaffected() {
+        let (status, body) = map("上游拒绝请求：CONTENT_LENGTH_EXCEEDS_THRESHOLD").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+
+        let (status, body) = map("上游拒绝请求：Input is too long").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+
+    /// 判据函数本身的纯逻辑测试（含负例，防止过宽匹配）
+    #[test]
+    fn test_is_credential_exhausted_error_predicate() {
+        // 正例
+        assert!(is_credential_exhausted_error("所有凭据均已禁用（0/3）"));
+        assert!(is_credential_exhausted_error(
+            "所有凭据均无法获取有效 Token（可用: 0/3）"
+        ));
+        assert!(is_credential_exhausted_error(
+            "MCP 请求失败（所有凭据已用尽）: 402"
+        ));
+
+        // 负例：不能被过宽匹配吞掉
+        assert!(!is_credential_exhausted_error(
+            "ide API 请求失败: 500 Internal Server Error"
+        ));
+        assert!(!is_credential_exhausted_error(
+            "ide API 请求失败: 429 Too Many Requests"
+        ));
+        assert!(!is_credential_exhausted_error("failed to parse credentials file"));
+        assert!(!is_credential_exhausted_error(""));
+        // 只提到单个凭据的失败，不属于「全部不可用」
+        assert!(!is_credential_exhausted_error("凭据 #2 Token 刷新失败"));
+        assert!(!is_credential_exhausted_error("凭据 #2 已禁用"));
+    }
 }

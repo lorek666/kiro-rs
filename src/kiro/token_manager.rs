@@ -1170,6 +1170,28 @@ impl MultiTokenManager {
     /// `report_failure` 的精确 `id`）。要精确到请求级需要把凭据 id 贯穿整条
     /// SSE 流，代价与收益不成比例。
     ///
+    /// ## 为什么不构成 ABBA 死锁
+    ///
+    /// 本函数里两次加锁是**顺序、分开**的，不是嵌套：
+    ///
+    /// ```ignore
+    /// let current = *self.current_id.lock();   // 语句内临时 guard，读到的瞬间即释放
+    /// {
+    ///     let mut entries = self.entries.lock(); // 另一个独立临界区
+    ///     ...
+    /// }
+    /// ```
+    ///
+    /// `*self.current_id.lock()` 的 guard 是**语句内临时量**（语句结束即 drop），
+    /// 不跨语句存活，因此不存在「持有 current_id 再等 entries」的路径；
+    /// 与仓库里其它地方「先 `entries` 后 `current_id`」的常规顺序**不会**反向，
+    /// 也就没有 ABBA 条件。
+    ///
+    /// **但**「读 `current_id`」与「锁 `entries`」仍是两个独立临界区：两者之间
+    /// 若发生凭据切换，本次 credit 就会记到切换后的那个条目上 —— 这正是上面
+    /// 「归属口径」所说的近似，属**已知且接受**的行为，不是并发缺陷。
+    /// 该近似已记入 `PATCH-NOTES.md` §7（N8）。
+    ///
     /// 非有限值 / 负数一律忽略（与 `MeteringEvent::credits` 同口径，双保险）。
     pub fn report_credits(&self, credits: f64) {
         if !credits.is_finite() || credits <= 0.0 {
